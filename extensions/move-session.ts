@@ -18,84 +18,121 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+    readFileSync,
     statSync,
-    openSync,
-    readSync,
-    writeSync,
-    closeSync,
-    renameSync,
     unlinkSync,
+    writeFileSync,
 } from "node:fs";
 
 const TRASH_TIMEOUT_MS = 5000;
-const HEADER_READ_MAX = 8192;
-const COPY_CHUNK_SIZE = 65_536;
 
-/**
- * Remove parentSession from the first JSONL header line without loading
- * the entire file into memory
- */
-function clearParentSession(sessionFile: string): void {
-    const fd = openSync(sessionFile, "r");
-    const headerBuffer = Buffer.alloc(HEADER_READ_MAX);
-    const bytesRead = readSync(fd, headerBuffer, 0, HEADER_READ_MAX, 0);
-    const headerChunk = headerBuffer.toString("utf-8", 0, bytesRead);
-    const newlineIndex = headerChunk.indexOf("\n");
+type SessionHeader = {
+    type: "session";
+    version?: number;
+    id: string;
+    timestamp: string;
+    cwd: string;
+    parentSession?: string;
+};
 
-    if (newlineIndex === -1) {
-        closeSync(fd);
-        return;
+type SessionEntry = {
+    type: string;
+    id: string;
+    parentId: string | null;
+    timestamp: string;
+    targetId?: string;
+    label?: string;
+};
+
+function generateEntryId(seenIds: Set<string>): string {
+    let id = "";
+    do {
+        id = randomBytes(4).toString("hex");
+    } while (seenIds.has(id));
+    seenIds.add(id);
+    return id;
+}
+
+export function forkCurrentBranchToCwd(sourceSessionFile: string, targetCwd: string, leafId: string | null): string {
+    const content = readFileSync(sourceSessionFile, "utf8").trim();
+    if (!content) {
+        throw new Error(`Cannot fork: source session file is empty or invalid: ${sourceSessionFile}`);
     }
 
-    const header = JSON.parse(headerChunk.slice(0, newlineIndex));
-    if (!header.parentSession) {
-        closeSync(fd);
-        return;
+    const entries = content
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as SessionHeader | SessionEntry);
+
+    const header = entries.find((entry) => entry.type === "session") as SessionHeader | undefined;
+    if (!header) {
+        throw new Error(`Cannot fork: source session has no header: ${sourceSessionFile}`);
     }
 
-    delete header.parentSession;
-    const newHeaderLine = JSON.stringify(header) + "\n";
-    const originalHeaderBytes = Buffer.byteLength(headerChunk.slice(0, newlineIndex + 1), "utf-8");
+    const nonHeaderEntries = entries.filter((entry) => entry.type !== "session") as SessionEntry[];
+    const entriesById = new Map(nonHeaderEntries.map((entry) => [entry.id, entry]));
 
-    const temporaryPath = sessionFile + ".move-session-tmp";
-    let writeFd: number | undefined;
-    try {
-        writeFd = openSync(temporaryPath, "w");
-        const newHeaderBuffer = Buffer.from(newHeaderLine, "utf-8");
-        writeSync(writeFd, newHeaderBuffer, 0, newHeaderBuffer.length);
-
-        const copyBuffer = Buffer.alloc(COPY_CHUNK_SIZE);
-        let position = originalHeaderBytes;
-        while (true) {
-            const readCount = readSync(fd, copyBuffer, 0, COPY_CHUNK_SIZE, position);
-            if (readCount === 0) break;
-            writeSync(writeFd, copyBuffer, 0, readCount);
-            position += readCount;
+    const labelsById = new Map<string, string>();
+    for (const entry of nonHeaderEntries) {
+        if (entry.type !== "label" || !entry.targetId) continue;
+        if (entry.label) {
+            labelsById.set(entry.targetId, entry.label);
+        } else {
+            labelsById.delete(entry.targetId);
         }
-
-        closeSync(writeFd);
-        writeFd = undefined;
-        closeSync(fd);
-        renameSync(temporaryPath, sessionFile);
-    } catch (error) {
-        if (writeFd !== undefined) {
-            try {
-                closeSync(writeFd);
-            } catch {
-                // ignore cleanup close errors
-            }
-        }
-
-        closeSync(fd);
-        try {
-            unlinkSync(temporaryPath);
-        } catch {
-            // ignore cleanup unlink errors
-        }
-        throw error;
     }
+
+    const path: SessionEntry[] = [];
+    let currentId = leafId;
+    while (currentId) {
+        const entry = entriesById.get(currentId);
+        if (!entry) {
+            throw new Error(`Entry ${currentId} not found`);
+        }
+        path.push(entry);
+        currentId = entry.parentId;
+    }
+    path.reverse();
+
+    const pathWithoutLabels = path.filter((entry) => entry.type !== "label");
+    const seenIds = new Set(nonHeaderEntries.map((entry) => entry.id));
+    const labelEntries: SessionEntry[] = [];
+    let parentId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
+    for (const entry of pathWithoutLabels) {
+        const label = labelsById.get(entry.id);
+        if (!label) continue;
+        const labelEntry: SessionEntry = {
+            type: "label",
+            id: generateEntryId(seenIds),
+            parentId,
+            timestamp: new Date().toISOString(),
+            targetId: entry.id,
+            label,
+        };
+        labelEntries.push(labelEntry);
+        parentId = labelEntry.id;
+    }
+
+    const destination = SessionManager.create(targetCwd);
+    const destSessionFile = destination.getSessionFile();
+    if (!destSessionFile) {
+        throw new Error("Internal error: could not allocate destination session file");
+    }
+
+    const newHeader: SessionHeader = {
+        type: "session",
+        version: header.version,
+        id: destination.getSessionId(),
+        timestamp: new Date().toISOString(),
+        cwd: targetCwd,
+    };
+
+    const output = [newHeader, ...pathWithoutLabels, ...labelEntries].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+    writeFileSync(destSessionFile, output);
+    return destSessionFile;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -158,25 +195,10 @@ export default function (pi: ExtensionAPI) {
                 return;
             }
 
+            const activeLeafId = ctx.sessionManager.getLeafId();
+
             try {
-                const forked = SessionManager.forkFrom(sourceSessionFile, targetCwd);
-                const destSessionFile = forked.getSessionFile();
-
-                if (!destSessionFile) {
-                    ctx.ui.notify("Internal error: forkFrom() produced no session file", "error");
-                    return;
-                }
-
-                // We intend to move/replace the original session, so avoid leaving
-                // a parentSession pointer that may dangle after trashing the source.
-                try {
-                    clearParentSession(destSessionFile);
-                } catch (error: any) {
-                    ctx.ui.notify(
-                        `Warning: could not clear parent session reference: ${error?.message ?? String(error)}`,
-                        "warning"
-                    );
-                }
+                const destSessionFile = forkCurrentBranchToCwd(sourceSessionFile, targetCwd, activeLeafId);
 
                 // --- Tear down the parent's terminal usage ---
                 // We do this BEFORE spawning, to avoid nesting Kitty protocol flags.
